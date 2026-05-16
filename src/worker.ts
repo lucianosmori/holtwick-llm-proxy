@@ -90,8 +90,34 @@ export default {
     if (url.pathname === "/health") {
       return corsJson(200, { ok: true, model: GROQ_MODEL });
     }
+    // Warm path: fire a tiny non-streaming Groq request so the worker->Groq
+    // TLS handshake + model selection is hot when the player sends their
+    // first real /chat. Costs ~1 Groq request per warm (well inside free
+    // tier). Returns 200 fast even if Groq is slow — never blocks dialog open.
+    if (url.pathname === "/warm") {
+      if (!env.GROQ_API_KEY) return corsJson(200, { ok: false, reason: "no key" });
+      try {
+        const r = await fetch(GROQ_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${env.GROQ_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          signal: AbortSignal.timeout(4000),
+          body: JSON.stringify({
+            model: GROQ_MODEL,
+            messages: [{ role: "user", content: "hi" }],
+            max_tokens: 1,
+            temperature: 0,
+          }),
+        });
+        return corsJson(200, { ok: r.ok, upstream: r.status });
+      } catch (e) {
+        return corsJson(200, { ok: false, error: String((e as Error)?.message ?? e) });
+      }
+    }
     if (url.pathname !== "/chat") {
-      return corsJson(404, { error: "not found", paths: ["/chat", "/health"] });
+      return corsJson(404, { error: "not found", paths: ["/chat", "/health", "/warm"] });
     }
     if (request.method !== "POST") {
       return corsJson(405, { error: "POST only" });
@@ -154,10 +180,26 @@ export default {
   },
 
   // Cron-driven warmup. Runs every 5 minutes (see wrangler.toml [triggers]).
-  // Touches the isolate so request latency stays low for the rare player
-  // session that hits a cold edge node. No Groq call — that would waste the
-  // free-tier rate budget.
-  async scheduled(_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext): Promise<void> {
-    // Intentionally empty: scheduling alone keeps the isolate warm.
+  // Fires a 1-token Groq request so the worker->Groq TLS pipe stays hot
+  // across isolate refreshes. ~12 Groq req/hour — well inside the free tier
+  // (~1800 req/hour budget at 30 req/min).
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (!env.GROQ_API_KEY) return;
+    ctx.waitUntil(
+      fetch(GROQ_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({
+          model: GROQ_MODEL,
+          messages: [{ role: "user", content: "hi" }],
+          max_tokens: 1,
+          temperature: 0,
+        }),
+      }).catch(() => {}),
+    );
   },
 };

@@ -1,0 +1,10 @@
+name = "holtwick-llm"
+main = "src/worker.ts"
+compatibility_date = "2025-09-01"
+account_id = "a2ee7f59895a9e8b6da691e00d0ee380"
+
+# Enable a workers.dev URL: holtwick-llm.lucianosmori.workers.dev
+workers_dev = true
+
+# Secrets are set out-of-band via the API (see README).
+# Never commit the Groq key to this file or src/.

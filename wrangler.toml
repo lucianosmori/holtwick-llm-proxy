@@ -8,3 +8,9 @@ workers_dev = true
 
 # Secrets are set out-of-band via the API (see README).
 # Never commit the Groq key to this file or src/.
+
+# Keep the Worker isolate warm so the first /chat POST of a player session
+# doesn't pay cold-start latency. Cloudflare cron triggers are free and the
+# scheduled() handler in worker.ts is a no-op aside from touching the isolate.
+[triggers]
+crons = ["*/5 * * * *"]

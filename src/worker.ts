@@ -152,4 +152,12 @@ export default {
       },
     });
   },
+
+  // Cron-driven warmup. Runs every 5 minutes (see wrangler.toml [triggers]).
+  // Touches the isolate so request latency stays low for the rare player
+  // session that hits a cold edge node. No Groq call — that would waste the
+  // free-tier rate budget.
+  async scheduled(_event: ScheduledEvent, _env: Env, _ctx: ExecutionContext): Promise<void> {
+    // Intentionally empty: scheduling alone keeps the isolate warm.
+  },
 };

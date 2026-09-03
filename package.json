@@ -2,7 +2,8 @@
   "name": "holtwick-llm-proxy",
   "private": true,
   "version": "0.0.1",
-  "description": "Cloudflare Worker that proxies NPC chat requests from holtwick-voxel to Groq's Llama-3.1-8B (free tier). Keeps the API key in Cloudflare's secret store, never in the public game bundle.",
+  "type": "module",
+  "description": "Cloudflare Worker that proxies NPC chat requests from holtwick-voxel to Groq's openai/gpt-oss-20b (free tier). Keeps the API key in Cloudflare's secret store, never in the public game bundle.",
   "homepage": "https://github.com/lucianosmori/holtwick-llm-proxy",
   "repository": {
     "type": "git",
@@ -11,7 +12,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250115.0",

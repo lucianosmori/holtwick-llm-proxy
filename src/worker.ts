@@ -1,7 +1,12 @@
 // Cloudflare Worker that proxies NPC chat requests from holtwick-voxel to
-// Groq's Llama-3.1-8B-Instant. The Groq API key is held in Cloudflare's
-// secret store (set via `wrangler secret put GROQ_API_KEY` or the API)
-// and never appears in the public game bundle.
+// Groq. The Groq API key is held in Cloudflare's secret store (set via
+// `wrangler secret put GROQ_API_KEY` or the API) and never appears in the
+// public game bundle.
+//
+// Default model: openai/gpt-oss-20b — Groq's documented generally-available
+// replacement for llama-3.1-8b-instant after the 2026-08-16 free/developer
+// shutdown. Confirm current IDs at https://console.groq.com/docs/models and
+// https://console.groq.com/docs/deprecations before swapping GROQ_MODEL.
 //
 // Endpoint: POST /chat
 // Body:    { npc: { id, name, role, barks_idle, barks_combat }, history, userMsg }
@@ -11,13 +16,18 @@ export interface Env {
   GROQ_API_KEY: string;
 }
 
-const GROQ_MODEL = "llama-3.1-8b-instant";
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const MAX_TOKENS = 200;
-const TEMPERATURE = 0.8;
-const HISTORY_TURN_CAP = 12;
+// Production Groq chat model on the free/developer tier. Do not revert to
+// llama-3.1-8b-instant: Groq returns 404 model_not_found for that id.
+export const GROQ_MODEL = "openai/gpt-oss-20b";
+export const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+export const MAX_TOKENS = 200;
+export const TEMPERATURE = 0.8;
+export const HISTORY_TURN_CAP = 12;
+export const WARM_TIMEOUT_MS = 4000;
+export const SCHEDULED_TIMEOUT_MS = 5000;
+const UPSTREAM_BODY_CAP = 400;
 
-const CORS_HEADERS: Record<string, string> = {
+export const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
@@ -43,11 +53,56 @@ interface ChatRequest {
   userMsg: string;
 }
 
+type GroqMessage = { role: "system" | "user" | "assistant"; content: string };
+
 function corsJson(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
   });
+}
+
+function groqHeaders(apiKey: string): HeadersInit {
+  return {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+  };
+}
+
+// reasoning_effort "low" keeps NPC replies fast; include_reasoning false so
+// the voxel client only sees the spoken line in the OpenAI-compatible stream.
+// GPT-OSS does not support reasoning_format (see Groq reasoning docs).
+function groqChatBody(
+  messages: GroqMessage[],
+  opts: { stream?: boolean; max_completion_tokens?: number; temperature?: number } = {},
+): Record<string, unknown> {
+  return {
+    model: GROQ_MODEL,
+    messages,
+    temperature: opts.temperature ?? TEMPERATURE,
+    max_completion_tokens: opts.max_completion_tokens ?? MAX_TOKENS,
+    reasoning_effort: "low",
+    include_reasoning: false,
+    ...(opts.stream ? { stream: true } : {}),
+  };
+}
+
+export function isModelNotFound(status: number, body: string): boolean {
+  if (status !== 404 && status !== 400) return false;
+  return /model_not_found|does not exist or you do not have access/i.test(body);
+}
+
+export function groqUpstreamError(status: number, errText: string): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    error: "groq upstream error",
+    model: GROQ_MODEL,
+    upstream_status: status,
+    upstream_body: errText.slice(0, UPSTREAM_BODY_CAP),
+  };
+  if (isModelNotFound(status, errText)) {
+    payload.code = "model_not_found";
+  }
+  return payload;
 }
 
 function buildSystemPrompt(npc: NpcShape): string {
@@ -95,25 +150,28 @@ export default {
     // first real /chat. Costs ~1 Groq request per warm (well inside free
     // tier). Returns 200 fast even if Groq is slow — never blocks dialog open.
     if (url.pathname === "/warm") {
-      if (!env.GROQ_API_KEY) return corsJson(200, { ok: false, reason: "no key" });
+      if (!env.GROQ_API_KEY) return corsJson(200, { ok: false, model: GROQ_MODEL, reason: "no key" });
       try {
         const r = await fetch(GROQ_URL, {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${env.GROQ_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          signal: AbortSignal.timeout(4000),
-          body: JSON.stringify({
-            model: GROQ_MODEL,
-            messages: [{ role: "user", content: "hi" }],
-            max_tokens: 1,
-            temperature: 0,
-          }),
+          headers: groqHeaders(env.GROQ_API_KEY),
+          signal: AbortSignal.timeout(WARM_TIMEOUT_MS),
+          body: JSON.stringify(
+            groqChatBody([{ role: "user", content: "hi" }], {
+              max_completion_tokens: 16,
+              temperature: 0,
+            }),
+          ),
         });
-        return corsJson(200, { ok: r.ok, upstream: r.status });
+        if (r.ok) return corsJson(200, { ok: true, model: GROQ_MODEL, upstream: r.status });
+        const errText = await r.text();
+        return corsJson(200, { ok: false, ...groqUpstreamError(r.status, errText) });
       } catch (e) {
-        return corsJson(200, { ok: false, error: String((e as Error)?.message ?? e) });
+        return corsJson(200, {
+          ok: false,
+          model: GROQ_MODEL,
+          error: String((e as Error)?.message ?? e),
+        });
       }
     }
     if (url.pathname !== "/chat") {
@@ -138,34 +196,21 @@ export default {
     }
 
     const history = (parsed.history ?? []).slice(-HISTORY_TURN_CAP);
-    const messages = [
-      { role: "system" as const, content: buildSystemPrompt(parsed.npc) },
+    const messages: GroqMessage[] = [
+      { role: "system", content: buildSystemPrompt(parsed.npc) },
       ...history.map((t) => ({ role: t.role, content: t.content })),
-      { role: "user" as const, content: parsed.userMsg },
+      { role: "user", content: parsed.userMsg },
     ];
 
     const groqRes = await fetch(GROQ_URL, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages,
-        stream: true,
-        temperature: TEMPERATURE,
-        max_tokens: MAX_TOKENS,
-      }),
+      headers: groqHeaders(env.GROQ_API_KEY),
+      body: JSON.stringify(groqChatBody(messages, { stream: true })),
     });
 
     if (!groqRes.ok) {
       const errText = await groqRes.text();
-      return corsJson(groqRes.status, {
-        error: "groq upstream error",
-        upstream_status: groqRes.status,
-        upstream_body: errText.slice(0, 400),
-      });
+      return corsJson(groqRes.status, groqUpstreamError(groqRes.status, errText));
     }
 
     return new Response(groqRes.body, {
@@ -180,7 +225,7 @@ export default {
   },
 
   // Cron-driven warmup. Runs every 5 minutes (see wrangler.toml [triggers]).
-  // Fires a 1-token Groq request so the worker->Groq TLS pipe stays hot
+  // Fires a tiny Groq request so the worker->Groq TLS pipe stays hot
   // across isolate refreshes. ~12 Groq req/hour — well inside the free tier
   // (~1800 req/hour budget at 30 req/min).
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -188,17 +233,14 @@ export default {
     ctx.waitUntil(
       fetch(GROQ_URL, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.GROQ_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        signal: AbortSignal.timeout(5000),
-        body: JSON.stringify({
-          model: GROQ_MODEL,
-          messages: [{ role: "user", content: "hi" }],
-          max_tokens: 1,
-          temperature: 0,
-        }),
+        headers: groqHeaders(env.GROQ_API_KEY),
+        signal: AbortSignal.timeout(SCHEDULED_TIMEOUT_MS),
+        body: JSON.stringify(
+          groqChatBody([{ role: "user", content: "hi" }], {
+            max_completion_tokens: 16,
+            temperature: 0,
+          }),
+        ),
       }).catch(() => {}),
     );
   },
